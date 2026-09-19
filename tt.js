@@ -1830,6 +1830,24 @@ function createTweetEmbedElement(tweetId) {
         consoleError("Error parsing active threads from localStorage:", e);
     }
     let messagesByThreadId = {}; // Will be populated from DB
+    let messageMapById = new Map();
+    let renderedMessageDOMCache = new Map();
+
+    function rebuildMessageMapWithData(messagesData = messagesByThreadId) {
+        messageMapById.clear();
+        for (const threadId in messagesData) {
+            if (messagesData.hasOwnProperty(threadId) && Array.isArray(messagesData[threadId])) {
+                const msgs = messagesData[threadId];
+                for (let i = 0; i < msgs.length; i++) {
+                    const msg = msgs[i];
+                    if (msg && msg.id !== undefined) {
+                        messageMapById.set(Number(msg.id), msg);
+                    }
+                }
+            }
+        }
+    }
+
     let threadColors = {};
     try {
         threadColors = JSON.parse(localStorage.getItem(COLORS_KEY)) || {};
@@ -2180,16 +2198,7 @@ function triggerQuickReply(postId, threadId) {
     // --- Core Logic: Rendering, Fetching, Updating ---
 
     function findMessageById(messageId) {
-        messageId = Number(messageId);
-        for (const threadId in messagesByThreadId) {
-            if (messagesByThreadId.hasOwnProperty(threadId)) {
-                const foundMsg = messagesByThreadId[threadId].find(m => m.id === messageId);
-                if (foundMsg) {
-                    return foundMsg;
-                }
-            }
-        }
-        return null;
+        return messageMapById.get(Number(messageId)) || null;
     }
 
 function findMessageDepth(message, targetId, currentDepth = 0) {
@@ -2599,6 +2608,7 @@ function createThreadListItemElement(thread, isForTooltip = false) {
 
 
 function renderThreadList() {
+    rebuildMessageMapWithData();
     if (threadTitleAnimationInterval) {
         clearInterval(threadTitleAnimationInterval);
         threadTitleAnimationInterval = null;
@@ -2973,6 +2983,7 @@ function renderThreadList() {
         }
         createdBlobUrls.clear();
         videoBlobUrlCache.clear(); // Also clear the video blob URL cache
+        renderedMessageDOMCache.clear();
 
         // Clear state for full rebuild (using global sets)
         renderedMessageIdsInViewer.clear();
@@ -3891,23 +3902,31 @@ function _populateAttachmentDivWithMedia(
             const sourceUrl = `https://i.4cdn.org/${actualBoardForLink}/${message.attachment.tim}${extLower.startsWith('.') ? extLower : '.' + extLower}`;
 
             const loadFromCache = (fallbackToSource = false) => {
-                if (message.attachment.localStoreId && otkMediaDB) {
-                    const filehash = message.attachment.filehash_db_key;
-                    if (videoBlobUrlCache.has(filehash)) {
-                        video.src = videoBlobUrlCache.get(filehash);
-                        return;
-                    }
+                const filehash = message.attachment.filehash_db_key || `${message.attachment.tim}${extLower}`;
+                if (videoBlobUrlCache.has(filehash)) {
+                    video.src = videoBlobUrlCache.get(filehash);
+                    return;
+                }
 
+                const handleFallback = () => {
+                    if (fallbackToSource) {
+                        consoleLog(`[MediaLoad] Video cache miss/error for ${filehash}. Fetching blob via safeFetchBlob for same-origin play.`);
+                        safeFetchBlob(sourceUrl, 15000).then(blob => {
+                            const dataURL = URL.createObjectURL(blob);
+                            createdBlobUrls.add(dataURL);
+                            videoBlobUrlCache.set(filehash, dataURL);
+                            video.src = dataURL;
+                        }).catch(e => {
+                            consoleError(`[MediaLoad] safeFetchBlob failed for video ${filehash}:`, e);
+                            video.src = sourceUrl;
+                        });
+                    }
+                };
+
+                if (message.attachment.localStoreId && otkMediaDB) {
                     const transaction = otkMediaDB.transaction(['mediaStore'], 'readonly');
                     const store = transaction.objectStore('mediaStore');
                     const request = store.get(message.attachment.localStoreId);
-
-                    const handleError = () => {
-                        if (fallbackToSource) {
-                            consoleLog(`[MediaLoad] Video cache miss/error for ${filehash}. Falling back to network.`);
-                            video.src = sourceUrl;
-                        }
-                    };
 
                     request.onsuccess = (event) => {
                         const storedItem = event.target.result;
@@ -3917,15 +3936,12 @@ function _populateAttachmentDivWithMedia(
                             videoBlobUrlCache.set(filehash, dataURL);
                             video.src = dataURL;
                         } else {
-                            handleError();
+                            handleFallback();
                         }
                     };
-                    request.onerror = handleError;
+                    request.onerror = handleFallback;
                 } else {
-                    if (fallbackToSource) {
-                        consoleLog(`[MediaLoad] No storeId for video. Falling back to network.`);
-                        video.src = sourceUrl;
-                    }
+                    handleFallback();
                 }
             };
 
@@ -3956,6 +3972,7 @@ function _populateAttachmentDivWithMedia(
         attachmentDiv.appendChild(attachmentContainer);
 
         const vSpan = document.createElement('span');
+        vSpan.className = 'otk-media-menu-icon';
         vSpan.textContent = '☰';
         vSpan.style.cssText = "cursor: pointer; color: var(--otk-media-menu-icon-color, #ff8040); font-weight: bold;";
 
@@ -4864,7 +4881,268 @@ function hideQuoteLinkAndCleanupNewline(textElement, quoteId) {
     }
 }
 
+function _bindQuotedMessageInstanceHandlers(clonedDiv, message, parentMessageId, boardForLink) {
+    const persistentInstanceId = `otk-msg-${parentMessageId || 'toplevel'}-${message.id}`;
+    clonedDiv.id = persistentInstanceId;
+    clonedDiv.setAttribute('data-original-message-id', message.id);
+
+    const pinIcon = clonedDiv.querySelector('.otk-pin-icon');
+    if (pinIcon) {
+        pinIcon.onclick = (event) => {
+            event.stopPropagation();
+            const isThisMessageAlreadyPinned = clonedDiv.classList.contains(PINNED_MESSAGE_CLASS);
+
+            document.querySelectorAll(`.${PINNED_MESSAGE_CLASS}`).forEach(el => {
+                el.classList.remove(PINNED_MESSAGE_CLASS);
+            });
+
+            if (isThisMessageAlreadyPinned) {
+                localStorage.removeItem(PINNED_MESSAGE_ID_KEY);
+                consoleLog(`Un-pinned message instance: ${persistentInstanceId}`);
+            } else {
+                clonedDiv.classList.add(PINNED_MESSAGE_CLASS);
+                localStorage.setItem(PINNED_MESSAGE_ID_KEY, persistentInstanceId);
+                consoleLog(`Pinned new message instance: ${persistentInstanceId}`);
+            }
+        };
+    }
+
+    const initiallyStoredPinnedId = localStorage.getItem(PINNED_MESSAGE_ID_KEY);
+    if (persistentInstanceId === initiallyStoredPinnedId) {
+        clonedDiv.classList.add(PINNED_MESSAGE_CLASS);
+        if (pinIcon) {
+            pinIcon.style.visibility = 'visible';
+        }
+    } else {
+        clonedDiv.classList.remove(PINNED_MESSAGE_CLASS);
+    }
+
+    if (unreadIds.has(message.id)) {
+        clonedDiv.classList.add('is-unread');
+    } else {
+        clonedDiv.classList.remove('is-unread');
+    }
+
+    const idSpan = clonedDiv.querySelector('.otk-msg-id-span');
+    if (idSpan) {
+        idSpan.onclick = (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            triggerQuickReply(message.id, message.originalThreadId);
+        };
+    }
+
+    const mqCheckbox = clonedDiv.querySelector('.otk-multiquote-checkbox');
+    if (mqCheckbox) {
+        mqCheckbox.checked = multiQuoteSelections.has(message.id);
+        const wrapper = mqCheckbox.closest('.otk-multiquote-checkbox-wrapper');
+        if (wrapper) {
+            if (mqCheckbox.checked) wrapper.classList.add('selected');
+            else wrapper.classList.remove('selected');
+        }
+        mqCheckbox.onclick = (e) => {
+            e.stopPropagation();
+            if (e.target.checked) {
+                multiQuoteSelections.add(message.id);
+                if (wrapper) wrapper.classList.add('selected');
+            } else {
+                multiQuoteSelections.delete(message.id);
+                if (wrapper) wrapper.classList.remove('selected');
+            }
+        };
+    }
+
+    if (message.attachment && message.attachment.ext) {
+        const actualBoard = boardForLink || message.board || 'b';
+        const extLower = message.attachment.ext.toLowerCase();
+        const filehash = message.attachment.filehash_db_key || `${message.attachment.tim}${extLower}`;
+        const isImage = ['.jpg', '.jpeg', '.png', '.gif'].includes(extLower);
+        const isVideo = extLower.endsWith('webm') || extLower.endsWith('mp4');
+        const mediaLoadModeSetting = localStorage.getItem('otkMediaLoadMode') || 'cache_only';
+        const isArchived = !activeThreads.includes(message.originalThreadId);
+        const mediaLoadMode = isArchived ? 'cache_only' : mediaLoadModeSetting;
+
+        const imageWrapper = clonedDiv.querySelector('.image-wrapper');
+        const img = imageWrapper ? imageWrapper.querySelector('img') : null;
+        if (imageWrapper && img) {
+            const setImageProperties = (mode, options = {}) => {
+                const { skipLoad = false } = options;
+                img.dataset.mode = mode;
+                let isThumb = (mode === 'thumb');
+                const sourceUrl = isThumb
+                    ? `https://i.4cdn.org/${actualBoard}/${message.attachment.tim}s.jpg`
+                    : `https://i.4cdn.org/${actualBoard}/${message.attachment.tim}${message.attachment.ext}`;
+
+                if (isThumb) {
+                    img.style.width = message.attachment.tn_w + 'px';
+                    img.style.height = message.attachment.tn_h + 'px';
+                    img.style.maxWidth = ''; img.style.maxHeight = ''; img.style.aspectRatio = '';
+                } else if (mode === 'full') {
+                    img.style.maxWidth = '85%'; img.style.maxHeight = '350px';
+                    img.style.width = 'auto'; img.style.height = 'auto';
+                    if (message.attachment.w && message.attachment.h) {
+                        img.style.aspectRatio = `${message.attachment.w} / ${message.attachment.h}`;
+                    }
+                } else {
+                    img.style.maxWidth = '100%'; img.style.maxHeight = 'none';
+                    img.style.width = 'auto'; img.style.height = 'auto';
+                    if (message.attachment.w && message.attachment.h) {
+                        img.style.aspectRatio = `${message.attachment.w} / ${message.attachment.h}`;
+                    }
+                }
+                if (skipLoad) return;
+                if (mediaLoadMode === 'cache_only') {
+                    const storeId = isThumb ? message.attachment.localThumbStoreId : message.attachment.localStoreId;
+                    if (storeId && otkMediaDB) {
+                        const transaction = otkMediaDB.transaction(['mediaStore'], 'readonly');
+                        const store = transaction.objectStore('mediaStore');
+                        const request = store.get(storeId);
+                        request.onsuccess = (e) => {
+                            const storedItem = e.target.result;
+                            if (storedItem && storedItem.blob) {
+                                const dataURL = URL.createObjectURL(storedItem.blob);
+                                createdBlobUrls.add(dataURL);
+                                img.src = dataURL;
+                            } else { img.src = sourceUrl; }
+                        };
+                        request.onerror = () => { img.src = sourceUrl; };
+                    } else { img.src = sourceUrl; }
+                } else {
+                    img.src = sourceUrl;
+                }
+            };
+
+            imageWrapper._otkLoadMedia = () => setImageProperties(img.dataset.mode);
+            imageWrapper._otkUnloadMedia = () => {
+                if (img.src && img.src.startsWith('blob:')) {
+                    if (createdBlobUrls.has(img.src)) {
+                        URL.revokeObjectURL(img.src);
+                        createdBlobUrls.delete(img.src);
+                    }
+                    img.removeAttribute('src');
+                }
+            };
+
+            const skipFullView = (message.attachment.h < 350 * 1.2) && (message.attachment.w < 1200);
+            img.onclick = () => {
+                const currentMode = img.dataset.mode;
+                let nextMode = (currentMode === 'thumb') ? (skipFullView ? 'original' : 'full') : (currentMode === 'full' ? 'original' : 'thumb');
+                imageWrapper.dataset.otkMediaLoaded = 'true';
+                setImageProperties(nextMode);
+            };
+        }
+
+        const videoWrapper = clonedDiv.querySelector('.video-wrapper');
+        const video = videoWrapper ? videoWrapper.querySelector('video') : null;
+        if (videoWrapper && video) {
+            const sourceUrl = `https://i.4cdn.org/${actualBoard}/${message.attachment.tim}${extLower.startsWith('.') ? extLower : '.' + extLower}`;
+            const loadFromCache = (fallbackToSource = false) => {
+                if (videoBlobUrlCache.has(filehash)) {
+                    video.src = videoBlobUrlCache.get(filehash);
+                    return;
+                }
+                const handleFallback = () => {
+                    if (fallbackToSource) {
+                        safeFetchBlob(sourceUrl, 15000).then(blob => {
+                            const dataURL = URL.createObjectURL(blob);
+                            createdBlobUrls.add(dataURL);
+                            videoBlobUrlCache.set(filehash, dataURL);
+                            video.src = dataURL;
+                        }).catch(e => { video.src = sourceUrl; });
+                    }
+                };
+                if (message.attachment.localStoreId && otkMediaDB) {
+                    const transaction = otkMediaDB.transaction(['mediaStore'], 'readonly');
+                    const store = transaction.objectStore('mediaStore');
+                    const request = store.get(message.attachment.localStoreId);
+                    request.onsuccess = (e) => {
+                        const storedItem = e.target.result;
+                        if (storedItem && storedItem.blob) {
+                            const dataURL = URL.createObjectURL(storedItem.blob);
+                            createdBlobUrls.add(dataURL);
+                            videoBlobUrlCache.set(filehash, dataURL);
+                            video.src = dataURL;
+                        } else { handleFallback(); }
+                    };
+                    request.onerror = handleFallback;
+                } else { handleFallback(); }
+            };
+
+            video.onerror = () => {
+                if (video.src.startsWith('blob:') && filehash && videoBlobUrlCache.has(filehash)) {
+                    videoBlobUrlCache.delete(filehash);
+                    video.onerror = null;
+                    loadFromCache(true);
+                }
+            };
+            videoWrapper._otkLoadMedia = () => loadFromCache(true);
+        }
+
+        const vSpan = clonedDiv.querySelector('.otk-media-menu-icon');
+        if (vSpan) {
+            vSpan.onclick = (e) => {
+                e.stopPropagation();
+                _createMediaPopupMenu({
+                    event: e,
+                    isImage: isImage,
+                    downloadHandler: () => {
+                        const url = `https://i.4cdn.org/${actualBoard}/${message.attachment.tim}${message.attachment.ext}`;
+                        safeFetchBlob(url, 15000).then(blob => {
+                            const objectUrl = URL.createObjectURL(blob);
+                            const link = document.createElement('a');
+                            link.href = objectUrl;
+                            link.download = message.attachment.filename;
+                            document.body.appendChild(link);
+                            link.click();
+                            document.body.removeChild(link);
+                            URL.revokeObjectURL(objectUrl);
+                        }).catch(error => { alert("Failed to download file."); });
+                    },
+                    resizeHandler: () => {
+                        if (isImage && img) {
+                            const currentMode = img.dataset.mode;
+                            const tnW = parseInt(img.dataset.thumbWidth, 10) || 0;
+                            const defaultToThumbnail = !((message.attachment.w <= 800 && message.attachment.h <= 600) || (message.attachment.w / message.attachment.h > 3) || tnW < 75);
+                            if (currentMode === 'original') {
+                                const previousMode = img.dataset.previousMode || (defaultToThumbnail ? 'thumb' : 'full');
+                                if (imageWrapper) imageWrapper._otkLoadMedia = () => setImageProperties(previousMode);
+                                setImageProperties(previousMode);
+                            } else {
+                                img.dataset.previousMode = currentMode;
+                                setImageProperties('original');
+                            }
+                        } else if (isVideo && video) {
+                            if (video.style.maxHeight === 'none') {
+                                video.style.maxHeight = video.dataset.defaultMaxHeight;
+                            } else {
+                                video.style.maxHeight = 'none';
+                            }
+                        }
+                    },
+                    blurHandler: () => { if (isImage) toggleImageBlur(filehash); },
+                    blockHandler: () => {
+                        const newRule = { id: Date.now(), action: 'filterOut', enabled: true, category: 'attachedMedia', matchContent: `md5:${filehash}`, replaceContent: '' };
+                        const filterWindow = document.getElementById('otk-filter-window');
+                        if (filterWindow) {
+                            filterWindow.style.display = 'flex';
+                            renderFilterEditorView(newRule);
+                        }
+                    }
+                });
+            };
+        }
+    }
+}
+
 function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId = null, ancestors = new Set(), visualDepth = null) {
+        const domCacheKey = `${message.id}_d${currentDepth}`;
+        if (!isTopLevelMessage && renderedMessageDOMCache.has(domCacheKey)) {
+            const cachedNode = renderedMessageDOMCache.get(domCacheKey);
+            const clonedDiv = cachedNode.cloneNode(true);
+            _bindQuotedMessageInstanceHandlers(clonedDiv, message, parentMessageId, boardForLink);
+            return clonedDiv;
+        }
+
         let pinIcon;
         const filterRules = JSON.parse(localStorage.getItem(FILTER_RULES_V2_KEY) || '[]');
 
@@ -5101,6 +5379,7 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
                 }
 
                 const idSpan = document.createElement('span');
+                idSpan.className = 'otk-msg-id-span';
                 idSpan.textContent = `#${message.id}`;
                 idSpan.style.cursor = 'pointer';
                 if (isFiltered) {
@@ -5310,6 +5589,7 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
                 headerContentWrapper.style.alignItems = 'center';
 
                 const idSpan = document.createElement('span');
+                idSpan.className = 'otk-msg-id-span';
                 idSpan.textContent = `#${message.id}`;
                 idSpan.style.cursor = 'pointer';
                 if (isFiltered) {
@@ -5329,15 +5609,7 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
             const [textElement, attachmentDiv, directQuoteIds] = _populateMessageBody(processedMessage, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId, newAncestors, allThemeSettings, shouldDisableUnderline, effectiveDepthForStyling);
             // Hide the direct quote link from Level 1 message body since it's shown in the block above it
             if (currentDepth === 1 && typeof directQuoteIds !== 'undefined' && directQuoteIds && directQuoteIds.length > 0) {
-                const existingGpIds = directQuoteIds.filter(id => {
-                    for (const threadIdKey in messagesByThreadId) {
-                        if (messagesByThreadId.hasOwnProperty(threadIdKey)) {
-                            const foundMsg = messagesByThreadId[threadIdKey].find(m => m.id === id);
-                            if (foundMsg) return true;
-                        }
-                    }
-                    return false;
-                });
+                const existingGpIds = directQuoteIds.filter(id => findMessageById(id) !== null);
                 if (existingGpIds.length > 0) {
                     const mostRecentGpId = Math.max(...existingGpIds);
                     hideQuoteLinkAndCleanupNewline(textElement, mostRecentGpId);
@@ -5346,29 +5618,12 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
             let quotesContainer = null;
             if (isTopLevelMessage && typeof directQuoteIds !== 'undefined' && directQuoteIds && directQuoteIds.length > 0) {
                 // Find all existing direct quotes
-                const existingQuotedIds = directQuoteIds.filter(id => {
-                    for (const threadIdKey in messagesByThreadId) {
-                        if (messagesByThreadId.hasOwnProperty(threadIdKey)) {
-                            const foundMsg = messagesByThreadId[threadIdKey].find(m => m.id === id);
-                            if (foundMsg) return true;
-                        }
-                    }
-                    return false;
-                });
+                const existingQuotedIds = directQuoteIds.filter(id => findMessageById(id) !== null);
 
                 if (existingQuotedIds.length > 0) {
                     // Limit shown quoted message to only the most recent one (highest ID)
                     const mostRecentQuotedId = Math.max(...existingQuotedIds);
-                    let parentMsgObj = null;
-                    for (const threadIdKey in messagesByThreadId) {
-                        if (messagesByThreadId.hasOwnProperty(threadIdKey)) {
-                            const foundMsg = messagesByThreadId[threadIdKey].find(m => m.id === mostRecentQuotedId);
-                            if (foundMsg) {
-                                parentMsgObj = foundMsg;
-                                break;
-                            }
-                        }
-                    }
+                    let parentMsgObj = findMessageById(mostRecentQuotedId);
 
                     if (parentMsgObj) {
                         // Find grandparent message (Level 2)
@@ -5384,27 +5639,11 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
                                 }
                             }
 
-                            const existingGpIds = gpIds.filter(id => {
-                                for (const threadIdKey in messagesByThreadId) {
-                                    if (messagesByThreadId.hasOwnProperty(threadIdKey)) {
-                                        const foundMsg = messagesByThreadId[threadIdKey].find(m => m.id === id);
-                                        if (foundMsg) return true;
-                                    }
-                                }
-                                return false;
-                            });
+                            const existingGpIds = gpIds.filter(id => findMessageById(id) !== null);
 
                             if (existingGpIds.length > 0) {
                                 const mostRecentGpId = Math.max(...existingGpIds);
-                                for (const threadIdKey in messagesByThreadId) {
-                                    if (messagesByThreadId.hasOwnProperty(threadIdKey)) {
-                                        const foundMsg = messagesByThreadId[threadIdKey].find(m => m.id === mostRecentGpId);
-                                        if (foundMsg) {
-                                            grandparentMsgObj = foundMsg;
-                                            break;
-                                        }
-                                    }
-                                }
+                                grandparentMsgObj = findMessageById(mostRecentGpId);
                             }
                         }
 
@@ -5626,6 +5865,9 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
                 }
             }
 
+            if (!isTopLevelMessage && !isFiltered) {
+                renderedMessageDOMCache.set(domCacheKey, messageDiv.cloneNode(true));
+            }
 
             return messageDiv;
         } // End of else (default layout)
@@ -12284,7 +12526,10 @@ function setupTimezoneSearch() {
     window.createMessageElementDOM = createMessageElementDOM;
     Object.defineProperty(window, 'messagesByThreadId', {
         get: () => messagesByThreadId,
-        set: (val) => { messagesByThreadId = val; },
+        set: (val) => {
+            messagesByThreadId = val;
+            rebuildMessageMapWithData(messagesByThreadId);
+        },
         configurable: true
     });
     Object.defineProperty(window, 'userPostIds', {
