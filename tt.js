@@ -12,6 +12,7 @@
 // @connect      4cdn.org
 // @connect      github.com
 // @connect      githubusercontent.com
+// @connect      youtube.com
 // @noframes
 // ==/UserScript==
 
