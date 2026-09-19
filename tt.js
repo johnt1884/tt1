@@ -708,6 +708,11 @@ function createYouTubeEmbedElement(videoId, timestampStr) {
         }
     }
 
+    let defaultEmbedUrl = `https://www.youtube.com/embed/${videoId}?autoplay=0`;
+    if (startSeconds > 0) {
+        defaultEmbedUrl += `&start=${startSeconds}`;
+    }
+
     const wrapper = document.createElement('div');
     wrapper.className = 'otk-youtube-embed-wrapper otk-embed-inline';
     wrapper.style.position = 'relative';
@@ -716,8 +721,10 @@ function createYouTubeEmbedElement(videoId, timestampStr) {
     wrapper.style.backgroundColor = '#000';
     wrapper.style.width = '480px';
     wrapper.style.height = '270px';
+    wrapper.dataset.embedUrl = defaultEmbedUrl;
 
     const createIframe = (embedUrl) => {
+        wrapper.dataset.embedUrl = embedUrl;
         const iframe = document.createElement('iframe');
         iframe.style.position = 'absolute';
         iframe.style.top = '0';
@@ -735,6 +742,12 @@ function createYouTubeEmbedElement(videoId, timestampStr) {
             wrapper.appendChild(iframe);
             if (mediaIntersectionObserver) {
                 mediaIntersectionObserver.observe(wrapper);
+                const rect = wrapper.getBoundingClientRect();
+                const container = document.getElementById('otk-messages-container');
+                const containerRect = container ? container.getBoundingClientRect() : { top: 0, bottom: window.innerHeight };
+                if (rect.top < containerRect.bottom + 200 && rect.bottom > containerRect.top - 200) {
+                    iframe.src = embedUrl;
+                }
             } else {
                 consoleWarn("[LazyLoad] mediaIntersectionObserver not ready. Iframe will load immediately:", iframe.dataset.src);
                 iframe.src = embedUrl;
@@ -755,6 +768,8 @@ function createYouTubeEmbedElement(videoId, timestampStr) {
         }
         createIframe(embedUrl);
     };
+
+    createIframe(defaultEmbedUrl);
 
     GM_xmlhttpRequest({
         method: 'GET',
@@ -783,20 +798,6 @@ function createYouTubeEmbedElement(videoId, timestampStr) {
             useFallback("oEmbed request failed.");
         }
     });
-
-    const placeholder = document.createElement('div');
-    placeholder.textContent = 'Loading YouTube embed...';
-    placeholder.style.cssText = `
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        width: 100%;
-        height: 100%;
-        background-color: #181818;
-        color: white;
-        font-size: 14px;
-    `;
-    wrapper.appendChild(placeholder);
 
     return wrapper;
 }
@@ -948,6 +949,7 @@ function createKickEmbedElement(clipId) {
 
     const wrapper = document.createElement('div');
     wrapper.className = 'otk-kick-embed-wrapper otk-embed-inline';
+    wrapper.dataset.embedUrl = embedUrl;
 
     wrapper.style.position = 'relative';
     wrapper.style.overflow = 'hidden';
@@ -991,6 +993,7 @@ function createTikTokEmbedElement(videoId) {
 
     const wrapper = document.createElement('div');
     wrapper.className = 'otk-tiktok-embed-wrapper otk-embed-inline';
+    wrapper.dataset.embedUrl = embedUrl;
 
     wrapper.style.position = 'relative';
     wrapper.style.overflow = 'hidden';
@@ -1036,6 +1039,7 @@ function createStreamableEmbedElement(videoId) {
 
     const wrapper = document.createElement('div');
     wrapper.className = 'otk-streamable-embed-wrapper otk-embed-inline'; // Common class for fixed-size embeds
+    wrapper.dataset.embedUrl = embedUrl;
 
     wrapper.style.position = 'relative';
     wrapper.style.overflow = 'hidden';
@@ -2271,14 +2275,14 @@ function findNextUnloadedQuoteLink(topLevelElement) {
                         id: quotedId,
                         parentId: messageId, // The parent for insertion is the element containing the link.
                     };
-                    }
                 }
             }
         }
+    }
 
     // 4. If we loop through everything and find no unloaded links, return null.
-        return null;
-    }
+    return null;
+}
 
 function isMessageFiltered(message, rules) {
     const messageText = (message.text || '').toLowerCase();
@@ -4887,7 +4891,9 @@ function _bindQuotedMessageInstanceHandlers(clonedDiv, message, parentMessageId,
     clonedDiv.id = persistentInstanceId;
     clonedDiv.setAttribute('data-original-message-id', message.id);
 
-    const pinIcon = clonedDiv.querySelector('.otk-pin-icon');
+    const directHeader = clonedDiv.firstElementChild;
+
+    const pinIcon = directHeader ? directHeader.querySelector('.otk-pin-icon') : null;
     if (pinIcon) {
         pinIcon.onclick = (event) => {
             event.stopPropagation();
@@ -4924,7 +4930,7 @@ function _bindQuotedMessageInstanceHandlers(clonedDiv, message, parentMessageId,
         clonedDiv.classList.remove('is-unread');
     }
 
-    const idSpan = clonedDiv.querySelector('.otk-msg-id-span');
+    const idSpan = directHeader ? directHeader.querySelector('.otk-msg-id-span') : null;
     if (idSpan) {
         idSpan.onclick = (e) => {
             e.stopPropagation();
@@ -4933,7 +4939,7 @@ function _bindQuotedMessageInstanceHandlers(clonedDiv, message, parentMessageId,
         };
     }
 
-    const mqCheckbox = clonedDiv.querySelector('.otk-multiquote-checkbox');
+    const mqCheckbox = directHeader ? directHeader.querySelector('.otk-multiquote-checkbox') : null;
     if (mqCheckbox) {
         mqCheckbox.checked = multiQuoteSelections.has(message.id);
         const wrapper = mqCheckbox.closest('.otk-multiquote-checkbox-wrapper');
@@ -4963,9 +4969,22 @@ function _bindQuotedMessageInstanceHandlers(clonedDiv, message, parentMessageId,
         const isArchived = !activeThreads.includes(message.originalThreadId);
         const mediaLoadMode = isArchived ? 'cache_only' : mediaLoadModeSetting;
 
-        const imageWrapper = clonedDiv.querySelector('.image-wrapper');
+        // Find media wrappers that belong directly to clonedDiv (i.e. not inside a nested quoted message within clonedDiv)
+        const isDirectMedia = (el) => {
+            let parent = el.parentElement;
+            while (parent && parent !== clonedDiv) {
+                if (parent.classList.contains('otk-message-container-main')) return false;
+                parent = parent.parentElement;
+            }
+            return parent === clonedDiv;
+        };
+
+        const imageWrapper = Array.from(clonedDiv.querySelectorAll('.image-wrapper')).find(isDirectMedia);
         const img = imageWrapper ? imageWrapper.querySelector('img') : null;
         if (imageWrapper && img) {
+            if (mediaAttachmentIntersectionObserver) {
+                mediaAttachmentIntersectionObserver.observe(imageWrapper);
+            }
             const setImageProperties = (mode, options = {}) => {
                 const { skipLoad = false } = options;
                 img.dataset.mode = mode;
@@ -5033,9 +5052,12 @@ function _bindQuotedMessageInstanceHandlers(clonedDiv, message, parentMessageId,
             };
         }
 
-        const videoWrapper = clonedDiv.querySelector('.video-wrapper');
+        const videoWrapper = Array.from(clonedDiv.querySelectorAll('.video-wrapper')).find(isDirectMedia);
         const video = videoWrapper ? videoWrapper.querySelector('video') : null;
         if (videoWrapper && video) {
+            if (mediaAttachmentIntersectionObserver) {
+                mediaAttachmentIntersectionObserver.observe(videoWrapper);
+            }
             const sourceUrl = `https://i.4cdn.org/${actualBoard}/${message.attachment.tim}${extLower.startsWith('.') ? extLower : '.' + extLower}`;
             const loadFromCache = (fallbackToSource = false) => {
                 if (videoBlobUrlCache.has(filehash)) {
@@ -5079,7 +5101,7 @@ function _bindQuotedMessageInstanceHandlers(clonedDiv, message, parentMessageId,
             videoWrapper._otkLoadMedia = () => loadFromCache(true);
         }
 
-        const vSpan = clonedDiv.querySelector('.otk-media-menu-icon');
+        const vSpan = Array.from(clonedDiv.querySelectorAll('.otk-media-menu-icon')).find(isDirectMedia);
         if (vSpan) {
             vSpan.onclick = (e) => {
                 e.stopPropagation();
@@ -5133,6 +5155,14 @@ function _bindQuotedMessageInstanceHandlers(clonedDiv, message, parentMessageId,
             };
         }
     }
+
+    // Register all embed wrappers in clonedDiv with mediaIntersectionObserver
+    const embedWrappers = clonedDiv.querySelectorAll('.otk-youtube-embed-wrapper, .otk-twitch-embed-wrapper, .otk-streamable-embed-wrapper, .otk-tiktok-embed-wrapper, .otk-kick-embed-wrapper');
+    embedWrappers.forEach(w => {
+        if (mediaIntersectionObserver) {
+            mediaIntersectionObserver.observe(w);
+        }
+    });
 }
 
 function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHashes, boardForLink, isTopLevelMessage, currentDepth, threadColor, parentMessageId = null, ancestors = new Set(), visualDepth = null) {
@@ -5867,6 +5897,9 @@ function createMessageElementDOM(message, mediaLoadPromises, uniqueImageViewerHa
             }
 
             if (!isTopLevelMessage && !isFiltered) {
+                if (renderedMessageDOMCache.size > 500) {
+                    renderedMessageDOMCache.clear();
+                }
                 renderedMessageDOMCache.set(domCacheKey, messageDiv.cloneNode(true));
             }
 
@@ -6687,6 +6720,7 @@ async function backgroundRefreshThreadsAndMessages(options = {}) { // Added opti
             }
             createdBlobUrls.clear();
             videoBlobUrlCache.clear();
+            renderedMessageDOMCache.clear();
             otkViewer.innerHTML = ''; // Clear existing viewer DOM
             renderedMessageIdsInViewer.clear(); // Clear the set of rendered message IDs
             uniqueImageViewerHashes.clear();
@@ -6897,6 +6931,7 @@ const scrollButtonContainer = document.getElementById('otk-scroll-button-contain
             viewerTopLevelAttachedVideoHashes.clear();
             viewerTopLevelEmbedIds.clear();
             renderedFullSizeImageHashes.clear();
+            renderedMessageDOMCache.clear();
             if (mediaIntersectionObserver) {
                 mediaIntersectionObserver.disconnect();
                 mediaIntersectionObserver = null;
@@ -12566,5 +12601,3 @@ function setupTimezoneSearch() {
     }
 
 })();
-
-
